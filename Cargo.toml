@@ -1,0 +1,16 @@
+[package]
+name = "os-terminal-ratatui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.8.5" # Only required to support the ratatui demo code
+# Had to pin this to an earlier version because unicode-width version requirements are conflicting with ratatui. This conflict might dissapear once ratitui 0.30.0 is released, unless os-terminal then jumps to a higher version of unicode-width as well.
+os-terminal = { version = "=0.6.10",   features = ["truetype"] }
+ratatui = "0.29.0"
+winit = "0.30.12"
+# The following are required to get the os-terminal stuff to compile
+keycode = "1.0.0"
+nix = { version = "0.30.1", features = ["term", "process", "fs"]}
+softbuffer = { version = "0.4.6", features = ["x11", "wayland"], default-features = false }
+arboard = { version = "3.6.1", features = ["wayland-data-control"], default-features = false }
