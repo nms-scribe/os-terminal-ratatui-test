@@ -1,24 +1,14 @@
 use std::error::Error;
-use std::ffi::CString;
 use std::num::NonZeroU32;
-use std::os::fd::AsFd;
-use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, process};
 
 use keycode::{KeyMap, KeyMapping};
-use nix::errno::Errno;
-use nix::libc::{ioctl, TIOCSWINSZ};
-use nix::pty::{openpty, OpenptyResult, Winsize};
-use nix::unistd::{close, execvp, fork, read, write, ForkResult};
-use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout, setsid};
 use os_terminal::font::TrueTypeFont;
 use os_terminal::{ClipboardHandler, DrawTarget, MouseInput, Rgb, Terminal};
-
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -26,6 +16,8 @@ use winit::event::{ElementState, Ime, MouseScrollDelta, StartCause, WindowEvent}
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{ImePurpose, Window, WindowAttributes, WindowId};
+
+use crate::tui::AppEvent;
 
 const DISPLAY_SIZE: (usize, usize) = (1024, 768);
 const TOUCHPAD_SCROLL_MULTIPLIER: f32 = 0.25;
@@ -42,99 +34,81 @@ impl ClipboardHandler for Clipboard {
     fn get_text(&mut self) -> Option<String> {
         self.0.get_text().ok()
     }
-
     fn set_text(&mut self, text: String) {
         self.0.set_text(text).unwrap();
     }
 }
 
-pub(crate) fn run() -> Result<(), Box<dyn Error>> {
-    let OpenptyResult { master, slave } = openpty(None, None)?;
+struct TerminalWriter {
+    terminal: Arc<Mutex<Terminal<Display>>>,
+    pending_draw: Arc<AtomicBool>,
+}
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            close(master.into_raw_fd())?;
-
-            setsid()?;
-            dup2_stdin(slave.as_fd())?;
-            dup2_stdout(slave.as_fd())?;
-            dup2_stderr(slave.as_fd())?;
-
-            crate::tui::run()?;
-            //let shell = env::var("SHELL").unwrap_or("bash".into());
-            //let _ = execvp::<CString>(&CString::new(shell)?, &[]);
+impl std::io::Write for TerminalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut term) = self.terminal.lock() {
+            term.process(buf);
+            self.pending_draw.store(true, Ordering::Relaxed);
         }
-        Ok(ForkResult::Parent { .. }) => {
-            close(slave.into_raw_fd())?;
-
-            let display = Display::default();
-            let buffer = display.buffer.clone();
-            let (ansi_sender, ansi_receiver) = channel();
-
-            let mut terminal = Terminal::new(display);
-            terminal.set_auto_flush(false);
-            terminal.set_scroll_speed(5);
-            terminal.set_logger(|args| println!("Terminal: {:?}", args));
-            terminal.set_clipboard(Box::new(Clipboard::new()));
-
-            terminal.set_pty_writer({
-                let ansi_sender = ansi_sender.clone();
-                Box::new(move |data| ansi_sender.send(data).unwrap())
-            });
-
-            let font_buffer = include_bytes!("FiraCodeNotoSans.ttf");
-            terminal.set_font_manager(Box::new(TrueTypeFont::new(10.0, font_buffer)));
-            terminal.set_history_size(1000);
-
-            let win_size = Winsize {
-                ws_row: terminal.rows() as u16,
-                ws_col: terminal.columns() as u16,
-                ws_xpixel: DISPLAY_SIZE.0 as u16,
-                ws_ypixel: DISPLAY_SIZE.1 as u16,
-            };
-
-            unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &win_size) };
-
-            let event_loop = EventLoop::new()?;
-            let terminal = Arc::new(Mutex::new(terminal));
-            let pending_draw = Arc::new(AtomicBool::new(false));
-
-            let mut app = App::new(
-                ansi_sender,
-                buffer.clone(),
-                terminal.clone(),
-                pending_draw.clone(),
-            );
-
-            let master_clone = master.try_clone()?;
-            std::thread::spawn(move || {
-                let mut temp = [0u8; 4096];
-                loop {
-                    match read(master_clone.as_fd(), &mut temp) {
-                        Ok(n) if n > 0 => {
-                            terminal.lock().unwrap().process(&temp[..n]);
-                            pending_draw.store(true, Ordering::Relaxed);
-                        }
-                        Ok(_) => break,
-                        Err(Errno::EIO) => process::exit(0),
-                        Err(e) => {
-                            eprintln!("Error reading from PTY: {:?}", e);
-                            process::exit(1)
-                        }
-                    }
-                }
-            });
-
-            std::thread::spawn(move || {
-                while let Ok(key) = ansi_receiver.recv() {
-                    write(master.as_fd(), key.as_bytes()).unwrap();
-                }
-            });
-
-            event_loop.run_app(&mut app)?;
-        }
-        Err(_) => eprintln!("Fork failed"),
+        Ok(buf.len())
     }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn run_tui_thread(writer: TerminalWriter, input_rx: Receiver<AppEvent>) {
+    std::thread::spawn(move || {
+        // tui::run 现在接收 writer 泛型
+        if let Err(e) = crate::tui::run(writer, input_rx) {
+            eprintln!("TUI Error: {}", e);
+        }
+    });
+}
+
+pub(crate) fn run() -> Result<(), Box<dyn Error>> {
+    let display = Display::default();
+    let buffer = display.buffer.clone();
+
+    let (input_tx, input_rx) = channel::<AppEvent>();
+
+    let mut terminal = Terminal::new(display);
+    terminal.set_auto_flush(false);
+    terminal.set_scroll_speed(5);
+    terminal.set_logger(|args| println!("Terminal Log: {:?}", args));
+    terminal.set_clipboard(Box::new(Clipboard::new()));
+
+    let input_tx_clone = input_tx.clone();
+    terminal.set_pty_writer({
+        Box::new(move |data| {
+            if let Ok(s) = std::str::from_utf8(data.as_bytes()) {
+                input_tx_clone.send(AppEvent::Input(s.to_string())).unwrap();
+            }
+        })
+    });
+
+    let font_buffer = include_bytes!("FiraCodeNotoSans.ttf");
+    terminal.set_font_manager(Box::new(TrueTypeFont::new(10.0, font_buffer)));
+    terminal.set_history_size(1000);
+
+    let terminal = Arc::new(Mutex::new(terminal));
+    let pending_draw = Arc::new(AtomicBool::new(false));
+
+    let writer = TerminalWriter {
+        terminal: terminal.clone(),
+        pending_draw: pending_draw.clone(),
+    };
+    run_tui_thread(writer, input_rx);
+
+    let event_loop = EventLoop::new()?;
+    let mut app = App::new(
+        buffer.clone(),
+        terminal.clone(),
+        pending_draw.clone(),
+        input_tx,
+    );
+
+    event_loop.run_app(&mut app)?;
 
     Ok(())
 }
@@ -172,29 +146,29 @@ impl DrawTarget for Display {
 }
 
 struct App {
-    ansi_sender: Sender<String>,
     buffer: Arc<Vec<AtomicU32>>,
     terminal: Arc<Mutex<Terminal<Display>>>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     pending_draw: Arc<AtomicBool>,
+    input_tx: Sender<AppEvent>,
     scroll_accumulator: f32,
 }
 
 impl App {
     fn new(
-        ansi_sender: Sender<String>,
         buffer: Arc<Vec<AtomicU32>>,
         terminal: Arc<Mutex<Terminal<Display>>>,
         pending_draw: Arc<AtomicBool>,
+        input_tx: Sender<AppEvent>,
     ) -> Self {
         Self {
-            ansi_sender,
             buffer,
             terminal,
             window: None,
             surface: None,
             pending_draw,
+            input_tx,
             scroll_accumulator: 0.0,
         }
     }
@@ -253,6 +227,12 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.surface = Some(surface);
+
+        let terminal = self.terminal.lock().unwrap();
+        let (cols, rows) = (terminal.columns(), terminal.rows());
+        self.input_tx
+            .send(AppEvent::Resize(cols as u16, rows as u16))
+            .unwrap();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -261,7 +241,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.ansi_sender.send(text).unwrap();
+                self.input_tx.send(AppEvent::Input(text)).unwrap();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.scroll_accumulator += match delta {
