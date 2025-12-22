@@ -1,34 +1,40 @@
 use std::{
     error::Error,
     io::{self, Write},
+    sync::{Arc, Mutex, mpsc::Receiver},
     time::{Duration, Instant},
 };
 
 use ratatui::{
+    Terminal,
     backend::{Backend, CrosstermBackend},
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{DisableMouseCapture, EnableMouseCapture, KeyCode},
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen},
     },
-    Terminal,
 };
 
-use crate::tui::{app::App, ui};
+use crate::tui::{AppEvent, VirtualBackend, app::App, ui};
 
-pub fn run<Writer: Write>(tick_rate: Duration, enhanced_graphics: bool, mut stdout: Writer) -> Result<(), Box<dyn Error>> {
+pub fn run<W: Write>(
+    tick_rate: Duration,
+    enhanced_graphics: bool,
+    mut stdout: W,
+    input_rx: Receiver<AppEvent>,
+    size_handle: Arc<Mutex<(u16, u16)>>,
+) -> Result<(), Box<dyn Error>> {
     // setup terminal
-    enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    let inner = CrosstermBackend::new(stdout);
+    let backend = VirtualBackend::new(inner, size_handle.clone());
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
     let app = App::new("Crossterm Demo", enhanced_graphics);
-    let app_result = run_app(&mut terminal, app, tick_rate);
+    let app_result = run_app(&mut terminal, app, tick_rate, input_rx, size_handle);
 
     // restore terminal
-    disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -47,16 +53,28 @@ fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
     tick_rate: Duration,
+    input_rx: Receiver<AppEvent>,
+    size_handle: Arc<Mutex<(u16, u16)>>,
 ) -> io::Result<()> {
     let mut last_tick = Instant::now();
+
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
+        match input_rx.recv_timeout(timeout) {
+            Ok(AppEvent::Input(ansi)) => {
+                let key_code = match ansi.as_str() {
+                    "\x1b[A" => Some(KeyCode::Up),
+                    "\x1b[B" => Some(KeyCode::Down),
+                    "\x1b[C" => Some(KeyCode::Right),
+                    "\x1b[D" => Some(KeyCode::Left),
+                    s if s.len() == 1 => Some(KeyCode::Char(s.chars().next().unwrap())),
+                    _ => None,
+                };
+
+                if let Some(code) = key_code {
+                    match code {
                         KeyCode::Left | KeyCode::Char('h') => app.on_left(),
                         KeyCode::Up | KeyCode::Char('k') => app.on_up(),
                         KeyCode::Right | KeyCode::Char('l') => app.on_right(),
@@ -66,6 +84,10 @@ fn run_app<B: Backend>(
                     }
                 }
             }
+            Ok(AppEvent::Resize(cols, rows)) => {
+                *size_handle.lock().unwrap() = (cols, rows);
+            }
+            Err(_) => {}
         }
         if last_tick.elapsed() >= tick_rate {
             app.on_tick();
