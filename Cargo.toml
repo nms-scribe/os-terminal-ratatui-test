@@ -11,6 +11,5 @@ ratatui = "0.29.0"
 winit = "0.30.12"
 # The following are required to get the os-terminal stuff to compile
 keycode = "1.0.0"
-nix = { version = "0.30.1", features = ["term", "process", "fs"]}
 softbuffer = { version = "0.4.6", features = ["x11", "wayland"], default-features = false }
 arboard = { version = "3.6.1", features = ["wayland-data-control"], default-features = false }
