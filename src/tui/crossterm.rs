@@ -1,40 +1,74 @@
 use std::{
     error::Error,
-    io::{self, Write},
-    sync::{Arc, Mutex, mpsc::Receiver},
-    time::{Duration, Instant},
+    io::Write,
+    time::Duration,
 };
 
 use ratatui::{
     Terminal,
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     crossterm::{
-        event::{DisableMouseCapture, EnableMouseCapture, KeyCode},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event},
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
 };
 
-use crate::tui::{AppEvent, VirtualBackend, app::App, ui};
+use crate::tui::{app::App, screen::Screen};
 
-pub fn run<W: Write>(
+pub(crate) struct CrosstermScreen;
+
+impl<W: Write> Screen<W> for CrosstermScreen {
+
+    type Backend = CrosstermBackend<W>;
+
+    fn poll_and_read(&self, timeout: Duration) -> Result<Option<Event>,Box<dyn Error>> {
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn enable_raw_mode(&self) -> Result<(),Box<dyn Error>> {
+        Ok(enable_raw_mode()?)
+    }
+
+    fn disable_raw_mode(&self) -> Result<(),Box<dyn Error>> {
+        Ok(disable_raw_mode()?)
+    }
+
+    fn create_backend(&self, stdout: W) -> Self::Backend {
+        CrosstermBackend::new(stdout)
+    }
+
+    fn resize(&self, _cols: u16, _rows: u16) {
+        // do nothing, the terminal can't resize
+    }
+
+
+
+}
+
+
+pub fn run<W: Write, S: Screen<W>>(
     tick_rate: Duration,
     enhanced_graphics: bool,
     mut stdout: W,
-    input_rx: Receiver<AppEvent>,
-    size_handle: Arc<Mutex<(u16, u16)>>,
+    screen: S,
 ) -> Result<(), Box<dyn Error>> {
     // setup terminal
+    screen.enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let inner = CrosstermBackend::new(stdout);
-    let backend = VirtualBackend::new(inner, size_handle.clone());
+    let backend = screen.create_backend(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
     let app = App::new("Crossterm Demo", enhanced_graphics);
-    let app_result = run_app(&mut terminal, app, tick_rate, input_rx, size_handle);
+    let app_result = app.run(&mut terminal, tick_rate, &screen);
 
     // restore terminal
+    screen.disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -47,54 +81,4 @@ pub fn run<W: Write>(
     }
 
     Ok(())
-}
-
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut app: App,
-    tick_rate: Duration,
-    input_rx: Receiver<AppEvent>,
-    size_handle: Arc<Mutex<(u16, u16)>>,
-) -> io::Result<()> {
-    let mut last_tick = Instant::now();
-
-    loop {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
-
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        match input_rx.recv_timeout(timeout) {
-            Ok(AppEvent::Input(ansi)) => {
-                let key_code = match ansi.as_str() {
-                    "\x1b[A" => Some(KeyCode::Up),
-                    "\x1b[B" => Some(KeyCode::Down),
-                    "\x1b[C" => Some(KeyCode::Right),
-                    "\x1b[D" => Some(KeyCode::Left),
-                    s if s.len() == 1 => Some(KeyCode::Char(s.chars().next().unwrap())),
-                    _ => None,
-                };
-
-                if let Some(code) = key_code {
-                    match code {
-                        KeyCode::Left | KeyCode::Char('h') => app.on_left(),
-                        KeyCode::Up | KeyCode::Char('k') => app.on_up(),
-                        KeyCode::Right | KeyCode::Char('l') => app.on_right(),
-                        KeyCode::Down | KeyCode::Char('j') => app.on_down(),
-                        KeyCode::Char(c) => app.on_key(c),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(AppEvent::Resize(cols, rows)) => {
-                *size_handle.lock().unwrap() = (cols, rows);
-            }
-            Err(_) => {}
-        }
-        if last_tick.elapsed() >= tick_rate {
-            app.on_tick();
-            last_tick = Instant::now();
-        }
-        if app.should_quit {
-            return Ok(());
-        }
-    }
 }

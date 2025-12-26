@@ -13,11 +13,20 @@ use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, MouseScrollDelta, StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{ImePurpose, Window, WindowAttributes, WindowId};
 
-use crate::tui::AppEvent;
+use crate::tui::crossterm;
+use std::io::{self, Write};
+use ratatui::crossterm::event::Event;
+use ratatui::prelude::{Backend, CrosstermBackend};
+use terminput::Event as TermInputEvent;
+use terminput_crossterm::to_crossterm;
+use ratatui::buffer::Cell;
+use ratatui::layout::{Position, Size};
+use ratatui::backend::WindowSize;
+use crate::tui::screen::Screen;
 
 const DISPLAY_SIZE: (usize, usize) = (1024, 768);
 const TOUCHPAD_SCROLL_MULTIPLIER: f32 = 0.25;
@@ -57,20 +66,165 @@ impl std::io::Write for TerminalWriter {
     }
 }
 
-fn run_tui_thread(writer: TerminalWriter, input_rx: Receiver<AppEvent>) {
+pub struct VirtualBackend<W: io::Write> {
+    inner: CrosstermBackend<W>,
+    size: Arc<Mutex<(u16, u16)>>,
+}
+
+impl<W: io::Write> VirtualBackend<W> {
+    pub fn new(inner: CrosstermBackend<W>, size: Arc<Mutex<(u16, u16)>>) -> Self {
+        Self { inner, size }
+    }
+}
+
+impl<W: io::Write> io::Write for VirtualBackend<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
+impl<W: io::Write> Backend for VirtualBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        let (w, h) = *self.size.lock().unwrap();
+        Ok(Size::new(w, h))
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        let (w, h) = *self.size.lock().unwrap();
+        Ok(WindowSize {
+            columns_rows: Size {
+                width: w,
+                height: h,
+            },
+            pixels: Size {
+                width: 0,
+                height: 0,
+            },
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+
+    fn append_lines(&mut self, _n: u16) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn get_cursor(&mut self) -> io::Result<(u16, u16)> {
+        let ratatui::prelude::Position { x, y } = self.get_cursor_position()?;
+        Ok((x, y))
+    }
+
+    fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
+        self.set_cursor_position(ratatui::prelude::Position { x, y })
+    }
+}
+
+struct GUIScreen {
+    input_rx: Receiver<Event>,
+    size_handle: Arc<Mutex<(u16, u16)>>
+}
+
+
+impl<W: Write> Screen<W> for GUIScreen {
+
+    type Backend = VirtualBackend<W>;
+
+    fn poll_and_read(&self, timeout: Duration) -> Result<Option<Event>,Box<dyn Error>> {
+        match self.input_rx.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Ok(None)
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // FUTURE: Should I be returning an error?
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected.into())
+            }
+        }
+    }
+
+    fn enable_raw_mode(&self) -> Result<(),Box<dyn Error>> {
+        // nothing needs to be done here...
+        Ok(())
+    }
+
+    fn disable_raw_mode(&self) -> Result<(),Box<dyn Error>> {
+        // nothing needs to be done here...
+        Ok(())
+    }
+
+    fn create_backend(&self, stdout: W) -> Self::Backend {
+        let inner = CrosstermBackend::new(stdout);
+        VirtualBackend::new(inner, self.size_handle.clone())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        *self.size_handle.lock().unwrap() = (cols, rows)
+    }
+
+
+}
+
+fn run_tui_thread(writer: TerminalWriter, input_rx: Receiver<Event>, event_loop_proxy: EventLoopProxy<()>) {
     std::thread::spawn(move || {
-        // tui::run 现在接收 writer 泛型
-        if let Err(e) = crate::tui::run(writer, input_rx) {
+        let screen = GUIScreen {
+            input_rx,
+            size_handle: Arc::new(Mutex::new((80, 24)))
+        };
+        let tick_rate = Duration::from_millis(250);
+        if let Err(e) = crossterm::run(tick_rate, true, writer, screen) {
             eprintln!("TUI Error: {}", e);
         }
+        // send event to signal that the thread is done...
+        event_loop_proxy.send_event(())
     });
+}
+
+fn read_term_input(ansi: &str) -> Option<Event> {
+    let event = TermInputEvent::parse_from(ansi.as_bytes()).unwrap();
+    event.map(to_crossterm).transpose().unwrap()
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     let display = Display::default();
     let buffer = display.buffer.clone();
 
-    let (input_tx, input_rx) = channel::<AppEvent>();
+    let (input_tx, input_rx) = channel::<Event>();
 
     let mut terminal = Terminal::new(display);
     terminal.set_auto_flush(false);
@@ -82,7 +236,9 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     terminal.set_pty_writer({
         Box::new(move |data| {
             if let Ok(s) = std::str::from_utf8(data.as_bytes()) {
-                input_tx_clone.send(AppEvent::Input(s.to_string())).unwrap();
+                if let Some(event) = read_term_input(s) {
+                    input_tx_clone.send(event).unwrap()
+                }
             }
         })
     });
@@ -94,13 +250,15 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     let terminal = Arc::new(Mutex::new(terminal));
     let pending_draw = Arc::new(AtomicBool::new(false));
 
+    let event_loop = EventLoop::new()?;
+    let event_loop_proxy = event_loop.create_proxy();
+
     let writer = TerminalWriter {
         terminal: terminal.clone(),
         pending_draw: pending_draw.clone(),
     };
-    run_tui_thread(writer, input_rx);
+    run_tui_thread(writer, input_rx, event_loop_proxy);
 
-    let event_loop = EventLoop::new()?;
     let mut app = App::new(
         buffer.clone(),
         terminal.clone(),
@@ -151,7 +309,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     pending_draw: Arc<AtomicBool>,
-    input_tx: Sender<AppEvent>,
+    input_tx: Sender<Event>,
     scroll_accumulator: f32,
 }
 
@@ -160,7 +318,7 @@ impl App {
         buffer: Arc<Vec<AtomicU32>>,
         terminal: Arc<Mutex<Terminal<Display>>>,
         pending_draw: Arc<AtomicBool>,
-        input_tx: Sender<AppEvent>,
+        input_tx: Sender<Event>,
     ) -> Self {
         Self {
             buffer,
@@ -231,8 +389,13 @@ impl ApplicationHandler for App {
         let terminal = self.terminal.lock().unwrap();
         let (cols, rows) = (terminal.columns(), terminal.rows());
         self.input_tx
-            .send(AppEvent::Resize(cols as u16, rows as u16))
+            .send(Event::Resize(cols as u16, rows as u16))
             .unwrap();
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        // if I receive this then the terminal loop is done...
+        event_loop.exit();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -241,7 +404,9 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.input_tx.send(AppEvent::Input(text)).unwrap();
+                if let Some(event) = read_term_input(&text) {
+                    self.input_tx.send(event).unwrap();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.scroll_accumulator += match delta {
@@ -263,6 +428,7 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(evdev_code) = event.physical_key.to_scancode() {
                     if let Ok(keymap) =
+                        // FUTURE: from os-terminal author: "Note: remember to change KeyMapping::Evdev to something else if you run on other platforms like Windows."
                         KeyMap::from_key_mapping(KeyMapping::Evdev(evdev_code as u16))
                     {
                         // Windows scancode is 16-bit extended scancode

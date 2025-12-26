@@ -13,3 +13,5 @@ winit = "0.30.12"
 keycode = "1.0.0"
 softbuffer = { version = "0.4.6", features = ["x11", "wayland"], default-features = false }
 arboard = { version = "3.6.1", features = ["wayland-data-control"], default-features = false }
+terminput = "0.5.12"
+terminput-crossterm = { version = "0.4.8", features= ["crossterm_0_28"], default-features = false }

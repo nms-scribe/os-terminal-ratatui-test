@@ -2,7 +2,9 @@ use rand::{
     distributions::{Distribution, Uniform},
     rngs::ThreadRng,
 };
-use ratatui::widgets::ListState;
+use ratatui::{crossterm::event::{Event, KeyCode}, prelude::Backend, widgets::ListState, Terminal};
+use std::{error::Error, io::Write, time::{Duration, Instant}};
+use crate::tui::{screen::Screen, ui};
 
 const TASKS: [&str; 24] = [
     "Item1", "Item2", "Item3", "Item4", "Item5", "Item6", "Item7", "Item8", "Item9", "Item10",
@@ -342,5 +344,44 @@ impl<'a> App<'a> {
 
         let event = self.barchart.pop().unwrap();
         self.barchart.insert(0, event);
+    }
+
+    pub(crate) fn run<B: Backend, W: Write, S: Screen<W>>(
+        mut self,
+        terminal: &mut Terminal<B>,
+        tick_rate: Duration,
+        screen: &S,
+    ) -> Result<(),Box<dyn Error>> {
+        let mut last_tick = Instant::now();
+
+        loop {
+            terminal.draw(|frame| ui::draw(frame, &mut self))?;
+
+            let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+
+            match screen.poll_and_read(timeout)? {
+                Some(Event::Key(event)) => {
+                    match event.code {
+                        KeyCode::Left | KeyCode::Char('h') => self.on_left(),
+                        KeyCode::Up | KeyCode::Char('k') => self.on_up(),
+                        KeyCode::Right | KeyCode::Char('l') => self.on_right(),
+                        KeyCode::Down | KeyCode::Char('j') => self.on_down(),
+                        KeyCode::Char(c) => self.on_key(c),
+                        _ => {}
+                    }
+                }
+                Some(Event::Resize(cols, rows)) => {
+                    screen.resize(cols, rows);
+                }
+                Some(_) | None => {}
+            }
+            if last_tick.elapsed() >= tick_rate {
+                self.on_tick();
+                last_tick = Instant::now();
+            }
+            if self.should_quit {
+                return Ok(());
+            }
+        }
     }
 }
